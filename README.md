@@ -8,6 +8,8 @@ as **HFS (HTTP File Server)**, but written in pure Python so it runs on both
 No dependencies to install: it uses only Python's standard library (Tkinter for
 the window, `http.server` for the server).
 
+![FileShare running on macOS](fileshare-app-mac.jpg)
+
 ---
 
 ## Files
@@ -16,6 +18,7 @@ the window, `http.server` for the server).
 |--------------------------|-------------------------------------------------------------------|
 | `fileshare.py`           | The whole app — GUI + web server in one file.                     |
 | `run-windows-python.bat` | Windows one-step launcher: installs Python if needed, then runs the app. |
+| `fileshare-app-mac.jpg`  | Screenshot of the app (shown above).                              |
 
 ---
 
