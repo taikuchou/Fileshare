@@ -25,12 +25,13 @@ import sys
 import threading
 import time
 import urllib.parse
+import zipfile
 from datetime import datetime
 from functools import partial
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 APP_NAME = "FileShare"
-APP_VERSION = "1.0"
+APP_VERSION = "1.1"
 
 # ------------------------------------------------------------------------------------
 # Networking helpers
@@ -135,7 +136,11 @@ class FileShareHandler(BaseHTTPRequestHandler):
         if target is None:
             self.send_error(403, "Forbidden")
             return
-        if os.path.isdir(target):
+        query = urllib.parse.urlparse(self.path).query
+        params = urllib.parse.parse_qs(query)
+        if os.path.isdir(target) and "zip" in params:
+            self.serve_zip(target)
+        elif os.path.isdir(target):
             self.render_directory(target)
         elif os.path.isfile(target):
             self.serve_file(target)
@@ -183,6 +188,45 @@ class FileShareHandler(BaseHTTPRequestHandler):
             pass
         except Exception as e:
             self.log_message("error serving file: %s", e)
+
+    def serve_zip(self, target):
+        """Stream the whole directory (recursively) as a ZIP download."""
+        root = os.path.abspath(type(self).root_dir)
+        folder_name = os.path.basename(os.path.abspath(target)) or "files"
+        if os.path.abspath(target) == root:
+            folder_name = os.path.basename(root) or "share"
+        zip_name = re.sub(r'[\\/:*?"<>|]', "_", folder_name) + ".zip"
+
+        self.send_response(200)
+        self.send_header("Content-Type", "application/zip")
+        self.send_header(
+            "Content-Disposition", 'attachment; filename="%s"' % zip_name
+        )
+        # No Content-Length: the archive is streamed as it is built, and the
+        # connection close marks the end (handler speaks HTTP/1.0).
+        self.end_headers()
+
+        count = 0
+        try:
+            with zipfile.ZipFile(self.wfile, "w", zipfile.ZIP_DEFLATED) as zf:
+                for dirpath, dirnames, filenames in os.walk(target):
+                    # Sort for a stable, predictable archive layout.
+                    dirnames.sort()
+                    for fname in sorted(filenames):
+                        full = os.path.join(dirpath, fname)
+                        if not os.path.isfile(full):
+                            continue
+                        arcname = os.path.relpath(full, target)
+                        try:
+                            zf.write(full, arcname)
+                            count += 1
+                        except OSError as e:
+                            self.log_message("zip: skipped %s (%s)", arcname, e)
+            self.log_message("zipped %d file(s) from %s", count, folder_name)
+        except (BrokenPipeError, ConnectionResetError):
+            self.log_message("zip download cancelled by client")
+        except Exception as e:
+            self.log_message("zip error: %s", e)
 
     @staticmethod
     def copy_stream(src, dst, length=64 * 1024):
@@ -248,11 +292,21 @@ class FileShareHandler(BaseHTTPRequestHandler):
               </form>
             </div>"""
 
+        zip_html = ""
+        if entries:
+            zip_url = (url_base + "/" if url_base else "/") + "?zip=1"
+            zip_html = (
+                f'<a class="zipbtn" href="{zip_url}" title="Download this folder '
+                f'and all its subfolders as one ZIP file">&#11015;&#65039; '
+                f'Download all (.zip)</a>'
+            )
+
         page = PAGE_TEMPLATE.format(
             app=APP_NAME,
             path=html.escape(display_path),
             rows="\n".join(rows),
             upload=upload_html,
+            downloadall=zip_html,
             count=len(entries),
         )
         body = page.encode("utf-8")
@@ -360,6 +414,10 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
   .upbtn {{ background: #2b6cb0; color: #fff; border: none; padding: 9px 18px;
            border-radius: 8px; font-size: 14px; cursor: pointer; }}
   .upbtn:hover {{ background: #245a94; }}
+  .toolbar {{ margin: 16px 0 0; display: flex; justify-content: flex-end; }}
+  .zipbtn {{ display: inline-block; background: #2f855a; color: #fff; text-decoration: none;
+            padding: 9px 18px; border-radius: 8px; font-size: 14px; }}
+  .zipbtn:hover {{ background: #276749; }}
   footer {{ text-align: center; color: #90949c; font-size: 12px; margin-top: 24px; }}
   @media (prefers-color-scheme: dark) {{
     body {{ background: #18191a; color: #e4e6eb; }}
@@ -377,6 +435,7 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
   <div class="path">{path}</div>
 </header>
 <div class="wrap">
+  <div class="toolbar">{downloadall}</div>
   {upload}
   <table>
     <thead><tr><th>Name</th><th>Size</th><th>Modified</th></tr></thead>
