@@ -16,6 +16,8 @@ Author: built for Ken
 """
 
 import argparse
+import base64
+import hmac
 import html
 import io
 import os
@@ -31,7 +33,7 @@ from functools import partial
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 APP_NAME = "FileShare"
-APP_VERSION = "1.4.1"
+APP_VERSION = "1.2"
 
 # ------------------------------------------------------------------------------------
 # Networking helpers
@@ -116,7 +118,56 @@ class FileShareHandler(BaseHTTPRequestHandler):
     # These are injected by the server factory.
     root_dir = "."
     allow_upload = True
+    admin_user = "admin"
+    admin_pass = "passwd"
     log_callback = None
+
+    # ----- admin authentication (HTTP Basic) -----
+    def is_admin(self):
+        auth = self.headers.get("Authorization", "")
+        if not auth.startswith("Basic "):
+            return False
+        try:
+            userpass = base64.b64decode(auth[6:].strip()).decode("utf-8")
+            user, _, pwd = userpass.partition(":")
+        except Exception:
+            return False
+        cls = type(self)
+        return (hmac.compare_digest(user, cls.admin_user)
+                and hmac.compare_digest(pwd, cls.admin_pass))
+
+    def require_admin(self):
+        """Return True if authenticated as admin; otherwise send a 401
+        challenge (the browser pops up a login box) and return False.
+
+        The 401 body auto-redirects back to the folder page, so if the user
+        presses Cancel in the login box they land back where they were
+        instead of on a blank error page."""
+        if self.is_admin():
+            return True
+        back = urllib.parse.urlparse(self.path).path or "/"
+        if not back.endswith("/"):
+            back = back.rsplit("/", 1)[0] + "/"
+        esc = html.escape(back, quote=True)
+        body = (
+            '<!DOCTYPE html><html><head><meta charset="utf-8">'
+            f'<meta http-equiv="refresh" content="0;url={esc}">'
+            "<title>Login cancelled</title></head>"
+            '<body style="font-family:sans-serif;padding:24px">'
+            f'Login cancelled &mdash; <a href="{esc}">going back&hellip;</a>'
+            "</body></html>"
+        ).encode("utf-8")
+        self.send_response(401)
+        self.send_header("WWW-Authenticate", 'Basic realm="FileShare admin"')
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        try:
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        self.log_message("admin login required for %s", self.path)
+        return False
 
     # ----- logging -----
     def log_message(self, fmt, *args):
@@ -146,6 +197,15 @@ class FileShareHandler(BaseHTTPRequestHandler):
             return
         query = urllib.parse.urlparse(self.path).query
         params = urllib.parse.parse_qs(query)
+        if "login" in params:
+            # Explicit admin login: challenge until authenticated, then
+            # bounce back to the folder page (without the ?login query).
+            if self.require_admin():
+                back = urllib.parse.urlparse(self.path).path or "/"
+                self.send_response(303)
+                self.send_header("Location", back)
+                self.end_headers()
+            return
         if os.path.isdir(target) and "zip" in params:
             self.serve_zip(target)
         elif os.path.isdir(target):
@@ -364,9 +424,19 @@ class FileShareHandler(BaseHTTPRequestHandler):
             )
 
         upload_html = ""
+        action = url_base + "/" if url_base else "/"
+        is_admin = self.is_admin()
+        if is_admin:
+            # Logged in: no badge — the visible upload/create controls
+            # already show the admin state.
+            admin_link = ""
+        else:
+            admin_link = (f'<a class="adminlink" href="{action}?login=1" '
+                          f'title="Log in to upload and create folders">'
+                          f'&#128273; Admin</a>')
         if type(self).allow_upload:
-            action = url_base + "/" if url_base else "/"
-            upload_html = f"""
+            if is_admin:
+                upload_html = f"""
             <div class="upload">
               <form method="POST" action="{action}" enctype="multipart/form-data">
                 <label class="filebtn">
@@ -398,7 +468,8 @@ class FileShareHandler(BaseHTTPRequestHandler):
         page = PAGE_TEMPLATE.format(
             app=APP_NAME,
             path=html.escape(display_path),
-            action=(url_base + "/" if url_base else "/"),
+            action=action,
+            adminlink=admin_link,
             rows="\n".join(rows),
             upload=upload_html,
             downloadall=zip_html,
@@ -440,6 +511,8 @@ class FileShareHandler(BaseHTTPRequestHandler):
             if not type(self).allow_upload:
                 self.send_error(403, "Uploads are disabled")
                 return
+            if not self.require_admin():
+                return
             raw = (params.get("newfolder") or [""])[0].strip()
             # Sanitize: no path separators, no traversal, no leading dots.
             name = raw.replace("/", "_").replace("\\", "_").strip()
@@ -470,6 +543,8 @@ class FileShareHandler(BaseHTTPRequestHandler):
 
         if not type(self).allow_upload:
             self.send_error(403, "Uploads are disabled")
+            return
+        if not self.require_admin():
             return
         if "multipart/form-data" not in ctype:
             self.send_error(400, "Expected multipart/form-data")
@@ -535,6 +610,11 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
          margin: 0; background: #f5f6f8; color: #1c1e21; }}
   header {{ background: #2b6cb0; color: #fff; padding: 16px 20px; }}
   header h1 {{ margin: 0; font-size: 18px; font-weight: 600; }}
+  .hrow {{ display: flex; align-items: center; justify-content: space-between;
+          max-width: 960px; margin: 0 auto; }}
+  .adminlink {{ color: #fff; text-decoration: none; font-size: 13px; font-weight: 600;
+               background: rgba(255,255,255,.16); padding: 6px 14px; border-radius: 999px; }}
+  a.adminlink:hover {{ background: rgba(255,255,255,.28); }}
   header .path {{ margin-top: 4px; font-size: 13px; opacity: .9; word-break: break-all; }}
   .wrap {{ max-width: 960px; margin: 0 auto; padding: 16px 20px 60px; }}
   table {{ width: 100%; border-collapse: collapse; background: #fff; border-radius: 10px;
@@ -570,6 +650,7 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
   .selbtn:hover {{ background: #975a16; }}
   .selmsg {{ display: none; color: #c53030; font-size: 13px; font-weight: 600;
             align-self: center; margin-right: auto; }}
+  .loginbtn {{ text-decoration: none; display: inline-block; }}
   .toolbar {{ gap: 8px; }}
   td.chk, th.chk {{ width: 34px; text-align: center; padding-left: 10px; padding-right: 0; }}
   .chk input {{ width: 16px; height: 16px; cursor: pointer; }}
@@ -586,7 +667,10 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
 </head>
 <body>
 <header>
-  <h1>&#128225; {app}</h1>
+  <div class="hrow">
+    <h1>&#128225; {app}</h1>
+    {adminlink}
+  </div>
   <div class="path">{path}</div>
 </header>
 <div class="wrap">
@@ -629,13 +713,16 @@ class ServerController:
     def running(self):
         return self.httpd is not None
 
-    def start(self, directory, port, allow_upload=True):
+    def start(self, directory, port, allow_upload=True,
+              admin_user="admin", admin_pass="passwd"):
         if self.running:
             raise RuntimeError("Server already running")
 
         handler = type("BoundHandler", (FileShareHandler,), {
             "root_dir": os.path.abspath(directory),
             "allow_upload": allow_upload,
+            "admin_user": admin_user or "admin",
+            "admin_pass": admin_pass or "passwd",
             "log_callback": staticmethod(self.log_callback) if self.log_callback else None,
         })
 
@@ -705,6 +792,20 @@ def launch_gui(initial_dir=None, initial_port=8000):
     upload_var = tk.BooleanVar(value=True)
     ttk.Checkbutton(opts, text="Allow uploads", variable=upload_var).pack(side="left")
 
+    # --- admin credentials row ---
+    admin_frame = ttk.Frame(main)
+    admin_frame.pack(fill="x", pady=(6, 0))
+    ttk.Label(admin_frame, text="Admin ID:").pack(side="left")
+    admin_user_var = tk.StringVar(value="admin")
+    admin_user_entry = ttk.Entry(admin_frame, textvariable=admin_user_var, width=12)
+    admin_user_entry.pack(side="left", padx=(6, 16))
+    ttk.Label(admin_frame, text="Password:").pack(side="left")
+    admin_pass_var = tk.StringVar(value="passwd")
+    admin_pass_entry = ttk.Entry(admin_frame, textvariable=admin_pass_var, width=14, show="*")
+    admin_pass_entry.pack(side="left", padx=(6, 8))
+    ttk.Label(admin_frame, text="(needed to upload / create folders)",
+              foreground="#666").pack(side="left")
+
     # --- URL display ---
     url_var = tk.StringVar(value="Server stopped.")
     url_frame = ttk.Frame(main)
@@ -757,6 +858,8 @@ def launch_gui(initial_dir=None, initial_port=8000):
             copy_btn.configure(state="disabled")
             folder_entry.configure(state="normal")
             port_entry.configure(state="normal")
+            admin_user_entry.configure(state="normal")
+            admin_pass_entry.configure(state="normal")
             log("Server stopped.")
             return
 
@@ -772,8 +875,11 @@ def launch_gui(initial_dir=None, initial_port=8000):
             messagebox.showerror(APP_NAME, "Port must be a number between 1 and 65535.")
             return
 
+        admin_user = admin_user_var.get().strip() or "admin"
+        admin_pass = admin_pass_var.get() or "passwd"
         try:
-            controller.start(directory, port, allow_upload=upload_var.get())
+            controller.start(directory, port, allow_upload=upload_var.get(),
+                             admin_user=admin_user, admin_pass=admin_pass)
         except OSError as e:
             messagebox.showerror(APP_NAME, f"Could not start server on port {port}.\n\n{e}")
             return
@@ -785,8 +891,13 @@ def launch_gui(initial_dir=None, initial_port=8000):
         copy_btn.configure(state="normal")
         folder_entry.configure(state="disabled")
         port_entry.configure(state="disabled")
+        admin_user_entry.configure(state="disabled")
+        admin_pass_entry.configure(state="disabled")
         log(f"Serving '{directory}' at {url}")
         log(f"Uploads {'enabled' if upload_var.get() else 'disabled'}. Open the URL on any device on your network.")
+        log(f"Admin ID '{admin_user}' — uploading and creating folders require this login.")
+        if (admin_user, admin_pass) == ("admin", "passwd"):
+            log("WARNING: using the default admin/passwd credentials. Change them for anything sensitive.")
 
     start_btn = ttk.Button(main, text="Start server", command=toggle_server)
     start_btn.pack(pady=(10, 0), ipadx=10, ipady=2)
@@ -813,6 +924,10 @@ def main():
     parser.add_argument("-p", "--port", type=int, default=8000, help="Port to listen on (default 8000).")
     parser.add_argument("--no-upload", action="store_true", help="Disable file uploads.")
     parser.add_argument("--no-gui", action="store_true", help="Run headless in the terminal (no window).")
+    parser.add_argument("--admin-id", default="admin", metavar="ID",
+                        help="Admin login ID for uploads / creating folders (default: admin).")
+    parser.add_argument("--admin-password", default="passwd", metavar="PW",
+                        help="Admin password (default: passwd).")
     args = parser.parse_args()
 
     if args.no_gui:
@@ -821,11 +936,15 @@ def main():
             print(f"Error: '{directory}' is not a folder.", file=sys.stderr)
             sys.exit(1)
         controller = ServerController(log_callback=lambda m: print(m))
-        controller.start(directory, args.port, allow_upload=not args.no_upload)
+        controller.start(directory, args.port, allow_upload=not args.no_upload,
+                         admin_user=args.admin_id, admin_pass=args.admin_password)
         ip = get_lan_ip()
         print(f"{APP_NAME} {APP_VERSION} serving '{os.path.abspath(directory)}'")
         print(f"  -> http://{ip}:{args.port}   (http://localhost:{args.port})")
         print(f"  Uploads: {'disabled' if args.no_upload else 'enabled'}")
+        print(f"  Admin ID: {args.admin_id} (required for uploads / creating folders)")
+        if (args.admin_id, args.admin_password) == ("admin", "passwd"):
+            print("  WARNING: default admin/passwd credentials in use — change with --admin-id/--admin-password")
         print("Press Ctrl+C to stop.")
         try:
             while True:
