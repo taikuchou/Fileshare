@@ -16,11 +16,11 @@ Author: built for Ken
 """
 
 import argparse
-import base64
 import hmac
 import html
 import io
 import os
+import secrets
 import re
 import socket
 import sys
@@ -121,44 +121,66 @@ class FileShareHandler(BaseHTTPRequestHandler):
     admin_user = "admin"
     admin_pass = "passwd"
     log_callback = None
+    sessions = None          # dict of session-id -> expiry time, per server
+    SESSION_TTL = 8 * 3600   # an admin login stays valid for 8 hours
 
-    # ----- admin authentication (HTTP Basic) -----
+    # ----- admin authentication (login form + session cookie) -----
+    def get_session_id(self):
+        cookie = self.headers.get("Cookie", "")
+        for part in cookie.split(";"):
+            k, _, v = part.strip().partition("=")
+            if k == "fsid":
+                return v
+        return None
+
     def is_admin(self):
-        auth = self.headers.get("Authorization", "")
-        if not auth.startswith("Basic "):
+        sessions = type(self).sessions
+        if not sessions:
             return False
-        try:
-            userpass = base64.b64decode(auth[6:].strip()).decode("utf-8")
-            user, _, pwd = userpass.partition(":")
-        except Exception:
+        sid = self.get_session_id()
+        if not sid or sid not in sessions:
             return False
+        if sessions[sid] < time.time():
+            sessions.pop(sid, None)
+            return False
+        return True
+
+    def check_credentials(self, user, pwd):
         cls = type(self)
         return (hmac.compare_digest(user, cls.admin_user)
                 and hmac.compare_digest(pwd, cls.admin_pass))
 
-    def require_admin(self):
-        """Return True if authenticated as admin; otherwise send a 401
-        challenge (the browser pops up a login box) and return False.
+    def new_session(self):
+        sessions = type(self).sessions
+        now = time.time()
+        for k in [k for k, exp in list(sessions.items()) if exp < now]:
+            sessions.pop(k, None)
+        sid = secrets.token_hex(16)
+        sessions[sid] = now + self.SESSION_TTL
+        return sid
 
-        The 401 body auto-redirects back to the folder page, so if the user
-        presses Cancel in the login box they land back where they were
-        instead of on a blank error page."""
+    def dir_path(self):
+        """Directory part of the current URL path (always ends with /)."""
+        path = urllib.parse.urlparse(self.path).path or "/"
+        if not path.endswith("/"):
+            path = path.rsplit("/", 1)[0] + "/"
+        return path
+
+    def require_admin(self):
+        """True if the request carries a valid admin session; otherwise a
+        small 403 page linking to the login panel."""
         if self.is_admin():
             return True
-        back = urllib.parse.urlparse(self.path).path or "/"
-        if not back.endswith("/"):
-            back = back.rsplit("/", 1)[0] + "/"
-        esc = html.escape(back, quote=True)
+        esc = html.escape(self.dir_path(), quote=True)
         body = (
             '<!DOCTYPE html><html><head><meta charset="utf-8">'
-            f'<meta http-equiv="refresh" content="0;url={esc}">'
-            "<title>Login cancelled</title></head>"
+            "<title>Admin login required</title></head>"
             '<body style="font-family:sans-serif;padding:24px">'
-            f'Login cancelled &mdash; <a href="{esc}">going back&hellip;</a>'
-            "</body></html>"
+            "Admin login required (or your session expired). "
+            f'<a href="{esc}?login=1">Log in</a> &middot; '
+            f'<a href="{esc}">Back to files</a></body></html>'
         ).encode("utf-8")
-        self.send_response(401)
-        self.send_header("WWW-Authenticate", 'Basic realm="FileShare admin"')
+        self.send_response(403)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
@@ -168,6 +190,17 @@ class FileShareHandler(BaseHTTPRequestHandler):
             pass
         self.log_message("admin login required for %s", self.path)
         return False
+
+    def render_login(self, error=""):
+        action = html.escape(self.dir_path(), quote=True)
+        err_html = f'<div class="err">{html.escape(error)}</div>' if error else ""
+        page = LOGIN_TEMPLATE.format(app=APP_NAME, action=action, error=err_html)
+        body = page.encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
 
     # ----- logging -----
     def log_message(self, fmt, *args):
@@ -198,13 +231,24 @@ class FileShareHandler(BaseHTTPRequestHandler):
         query = urllib.parse.urlparse(self.path).query
         params = urllib.parse.parse_qs(query)
         if "login" in params:
-            # Explicit admin login: challenge until authenticated, then
-            # bounce back to the folder page (without the ?login query).
-            if self.require_admin():
-                back = urllib.parse.urlparse(self.path).path or "/"
+            # Show the login panel (or bounce back if already logged in).
+            if self.is_admin():
                 self.send_response(303)
-                self.send_header("Location", back)
+                self.send_header("Location", self.dir_path())
                 self.end_headers()
+            else:
+                self.render_login()
+            return
+        if "logout" in params:
+            sid = self.get_session_id()
+            if sid and type(self).sessions:
+                type(self).sessions.pop(sid, None)
+            self.send_response(303)
+            self.send_header("Location", self.dir_path())
+            self.send_header("Set-Cookie",
+                             "fsid=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax")
+            self.end_headers()
+            self.log_message("admin logged out")
             return
         if os.path.isdir(target) and "zip" in params:
             self.serve_zip(target)
@@ -427,9 +471,8 @@ class FileShareHandler(BaseHTTPRequestHandler):
         action = url_base + "/" if url_base else "/"
         is_admin = self.is_admin()
         if is_admin:
-            # Logged in: no badge — the visible upload/create controls
-            # already show the admin state.
-            admin_link = ""
+            admin_link = (f'<a class="adminlink" href="{action}?logout=1">'
+                          f'&#128682; Logout</a>')
         else:
             admin_link = (f'<a class="adminlink" href="{action}?login=1" '
                           f'title="Log in to upload and create folders">'
@@ -501,6 +544,25 @@ class FileShareHandler(BaseHTTPRequestHandler):
                 length = 0
             body = self.rfile.read(length).decode("utf-8", "replace") if length > 0 else ""
             params = urllib.parse.parse_qs(body)
+
+            # Login form submission.
+            if "dologin" in params:
+                user = (params.get("loginid") or [""])[0]
+                pwd = (params.get("loginpw") or [""])[0]
+                if self.check_credentials(user, pwd):
+                    sid = self.new_session()
+                    self.send_response(303)
+                    self.send_header("Location", self.dir_path())
+                    self.send_header(
+                        "Set-Cookie",
+                        f"fsid={sid}; Path=/; HttpOnly; SameSite=Lax",
+                    )
+                    self.end_headers()
+                    self.log_message("admin logged in")
+                else:
+                    self.log_message("failed admin login (id %r)", user)
+                    self.render_login("Wrong ID or password — please try again.")
+                return
 
             # "Download selected (.zip)" — read-only, allowed even when
             # uploads are disabled.
@@ -699,6 +761,61 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
 </html>"""
 
 
+LOGIN_TEMPLATE = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{app} - Admin login</title>
+<style>
+  :root {{ color-scheme: light dark; }}
+  * {{ box-sizing: border-box; }}
+  body {{ font-family: -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif;
+         margin: 0; background: #f5f6f8; color: #1c1e21; display: flex;
+         min-height: 100vh; align-items: center; justify-content: center; }}
+  .card {{ background: #fff; padding: 32px 36px; border-radius: 14px; width: 320px;
+          box-shadow: 0 4px 16px rgba(0,0,0,.10); }}
+  h1 {{ margin: 0 0 4px; font-size: 18px; }}
+  p {{ margin: 0 0 18px; color: #65676b; font-size: 13px; }}
+  label {{ display: block; font-size: 13px; font-weight: 600; margin: 12px 0 4px; }}
+  input {{ width: 100%; padding: 10px 12px; border: 1px solid #cbd5e0;
+          border-radius: 8px; font-size: 14px; background: inherit; color: inherit; }}
+  .err {{ background: #fed7d7; color: #c53030; padding: 8px 12px; border-radius: 8px;
+         font-size: 13px; margin-bottom: 6px; }}
+  .btns {{ display: flex; gap: 10px; margin-top: 20px; }}
+  button {{ flex: 1; background: #2b6cb0; color: #fff; border: none; padding: 10px;
+           border-radius: 8px; font-size: 14px; cursor: pointer; }}
+  button:hover {{ background: #245a94; }}
+  a.cancel {{ flex: 1; text-align: center; padding: 10px; border-radius: 8px;
+             background: #edf2f7; color: #1c1e21; text-decoration: none; font-size: 14px; }}
+  @media (prefers-color-scheme: dark) {{
+    body {{ background: #18191a; color: #e4e6eb; }}
+    .card {{ background: #242526; }}
+    a.cancel {{ background: #3a3b3c; color: #e4e6eb; }}
+  }}
+</style>
+</head>
+<body>
+  <div class="card">
+    <h1>&#128273; Admin login</h1>
+    <p>{app} &mdash; log in to upload files and create folders.</p>
+    {error}
+    <form method="POST" action="{action}">
+      <input type="hidden" name="dologin" value="1">
+      <label for="loginid">Admin ID</label>
+      <input type="text" id="loginid" name="loginid" autofocus autocomplete="username">
+      <label for="loginpw">Password</label>
+      <input type="password" id="loginpw" name="loginpw" autocomplete="current-password">
+      <div class="btns">
+        <button type="submit">Log in</button>
+        <a class="cancel" href="{action}">Cancel</a>
+      </div>
+    </form>
+  </div>
+</body>
+</html>"""
+
+
 # ------------------------------------------------------------------------------------
 # Server controller
 # ------------------------------------------------------------------------------------
@@ -723,6 +840,7 @@ class ServerController:
             "allow_upload": allow_upload,
             "admin_user": admin_user or "admin",
             "admin_pass": admin_pass or "passwd",
+            "sessions": {},
             "log_callback": staticmethod(self.log_callback) if self.log_callback else None,
         })
 
