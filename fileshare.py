@@ -31,7 +31,7 @@ from functools import partial
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 APP_NAME = "FileShare"
-APP_VERSION = "1.1"
+APP_VERSION = "1.4.1"
 
 # ------------------------------------------------------------------------------------
 # Networking helpers
@@ -94,6 +94,14 @@ def parse_multipart(body, boundary):
         file_match = re.search(r'filename="([^"]*)"', disp)
         field_name = name_match.group(1) if name_match else None
         filename = file_match.group(1) if file_match else None
+        # Browsers send filenames as raw UTF-8 bytes, but the headers were
+        # decoded as latin-1 above. Re-decode so non-ASCII names (Chinese,
+        # Japanese, Korean, accents, emoji, ...) come out right.
+        if filename:
+            try:
+                filename = filename.encode("latin-1").decode("utf-8")
+            except UnicodeError:
+                pass  # already valid text, or truly latin-1 — keep as is
         results.append((field_name, filename, content))
     return results
 
@@ -167,6 +175,21 @@ class FileShareHandler(BaseHTTPRequestHandler):
         ctype, _ = mimetypes.guess_type(path)
         return ctype or "application/octet-stream"
 
+    @staticmethod
+    def disposition(kind, filename):
+        """
+        Build a Content-Disposition header value that survives non-ASCII
+        (DBCS etc.) filenames. HTTP headers are latin-1 only, so UTF-8 names
+        are sent percent-encoded via the RFC 5987 filename* form.
+        """
+        clean = filename.replace('"', "")
+        try:
+            clean.encode("latin-1")
+            return '%s; filename="%s"' % (kind, clean)
+        except UnicodeEncodeError:
+            quoted = urllib.parse.quote(clean)
+            return "%s; filename*=UTF-8''%s" % (kind, quoted)
+
     def serve_file(self, target):
         try:
             fs = os.stat(target)
@@ -176,10 +199,7 @@ class FileShareHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(size))
             # Suggest a download filename while still allowing inline preview.
             fname = os.path.basename(target)
-            self.send_header(
-                "Content-Disposition",
-                'inline; filename="%s"' % fname.replace('"', ""),
-            )
+            self.send_header("Content-Disposition", self.disposition("inline", fname))
             self.send_header("Last-Modified", self.date_time_string(fs.st_mtime))
             self.end_headers()
             with open(target, "rb") as f:
@@ -199,9 +219,7 @@ class FileShareHandler(BaseHTTPRequestHandler):
 
         self.send_response(200)
         self.send_header("Content-Type", "application/zip")
-        self.send_header(
-            "Content-Disposition", 'attachment; filename="%s"' % zip_name
-        )
+        self.send_header("Content-Disposition", self.disposition("attachment", zip_name))
         # No Content-Length: the archive is streamed as it is built, and the
         # connection close marks the end (handler speaks HTTP/1.0).
         self.end_headers()
@@ -227,6 +245,72 @@ class FileShareHandler(BaseHTTPRequestHandler):
             self.log_message("zip download cancelled by client")
         except Exception as e:
             self.log_message("zip error: %s", e)
+
+    def serve_zip_selection(self, base_dir, names):
+        """Stream only the checked files/folders (from base_dir) as a ZIP."""
+        root = os.path.abspath(type(self).root_dir)
+        picked = []
+        for raw in names:
+            name = raw.strip().strip("/").strip("\\")
+            # One path component only — no separators, no traversal.
+            if not name or "/" in name or "\\" in name or name in (".", ".."):
+                continue
+            full = os.path.abspath(os.path.join(base_dir, name))
+            if full != root and not full.startswith(root + os.sep):
+                continue
+            if os.path.exists(full):
+                picked.append((name, full))
+
+        if not picked:
+            # Backstop for non-JS clients: send them back to the folder page
+            # instead of a bare error screen.
+            back = self.path if self.path.endswith("/") else self.path + "/"
+            self.send_response(303)
+            self.send_header("Location", back)
+            self.end_headers()
+            self.log_message("selection zip: nothing selected")
+            return
+
+        folder_name = os.path.basename(os.path.abspath(base_dir)) or "share"
+        zip_name = re.sub(r'[\\/:*?"<>|]', "_", folder_name) + "-selected.zip"
+
+        self.send_response(200)
+        self.send_header("Content-Type", "application/zip")
+        self.send_header("Content-Disposition", self.disposition("attachment", zip_name))
+        self.end_headers()
+
+        count = 0
+        try:
+            with zipfile.ZipFile(self.wfile, "w", zipfile.ZIP_DEFLATED) as zf:
+                for name, full in picked:
+                    if os.path.isfile(full):
+                        try:
+                            zf.write(full, name)
+                            count += 1
+                        except OSError as e:
+                            self.log_message("zip: skipped %s (%s)", name, e)
+                    elif os.path.isdir(full):
+                        for dirpath, dirnames, filenames in os.walk(full):
+                            dirnames.sort()
+                            for fname in sorted(filenames):
+                                fpath = os.path.join(dirpath, fname)
+                                if not os.path.isfile(fpath):
+                                    continue
+                                arcname = os.path.join(
+                                    name, os.path.relpath(fpath, full)
+                                ).replace(os.sep, "/")
+                                try:
+                                    zf.write(fpath, arcname)
+                                    count += 1
+                                except OSError as e:
+                                    self.log_message("zip: skipped %s (%s)", arcname, e)
+            self.log_message(
+                "zipped %d file(s) from %d selected item(s)", count, len(picked)
+            )
+        except (BrokenPipeError, ConnectionResetError):
+            self.log_message("selection zip cancelled by client")
+        except Exception as e:
+            self.log_message("selection zip error: %s", e)
 
     @staticmethod
     def copy_stream(src, dst, length=64 * 1024):
@@ -254,7 +338,7 @@ class FileShareHandler(BaseHTTPRequestHandler):
             parent = os.path.dirname(display_path.rstrip("/"))
             parent_url = urllib.parse.quote(parent) if parent != "/" else "/"
             rows.append(
-                f'<tr><td class="name"><a href="{parent_url or "/"}">'
+                f'<tr><td class="chk"></td><td class="name"><a href="{parent_url or "/"}">'
                 f'&#8617; ..</a></td><td></td><td></td></tr>'
             )
 
@@ -272,8 +356,10 @@ class FileShareHandler(BaseHTTPRequestHandler):
                 size, mtime = "", ""
             icon = "&#128193;" if is_dir else "&#128196;"
             label = html.escape(name) + ("/" if is_dir else "")
+            value = html.escape(name, quote=True)
             rows.append(
-                f'<tr><td class="name"><a href="{link}">{icon} {label}</a></td>'
+                f'<tr><td class="chk"><input type="checkbox" name="sel" value="{value}"></td>'
+                f'<td class="name"><a href="{link}">{icon} {label}</a></td>'
                 f'<td class="size">{size}</td><td class="date">{mtime}</td></tr>'
             )
 
@@ -290,12 +376,20 @@ class FileShareHandler(BaseHTTPRequestHandler):
                 <span id="fn" class="fn">No files selected</span>
                 <button type="submit" class="upbtn">Upload here</button>
               </form>
+              <form method="POST" action="{action}" class="mkdirform">
+                <input type="text" name="newfolder" class="txt" placeholder="New folder name"
+                       maxlength="120" required>
+                <button type="submit" class="upbtn mkbtn">&#128193; Create folder</button>
+              </form>
             </div>"""
 
         zip_html = ""
         if entries:
             zip_url = (url_base + "/" if url_base else "/") + "?zip=1"
             zip_html = (
+                f'<button type="submit" class="zipbtn selbtn" title="Download only the '
+                f'checked files and folders as one ZIP file">&#9745; '
+                f'Download selected (.zip)</button> '
                 f'<a class="zipbtn" href="{zip_url}" title="Download this folder '
                 f'and all its subfolders as one ZIP file">&#11015;&#65039; '
                 f'Download all (.zip)</a>'
@@ -304,6 +398,7 @@ class FileShareHandler(BaseHTTPRequestHandler):
         page = PAGE_TEMPLATE.format(
             app=APP_NAME,
             path=html.escape(display_path),
+            action=(url_base + "/" if url_base else "/"),
             rows="\n".join(rows),
             upload=upload_html,
             downloadall=zip_html,
@@ -318,9 +413,6 @@ class FileShareHandler(BaseHTTPRequestHandler):
 
     # ----- POST (upload) -----
     def do_POST(self):
-        if not type(self).allow_upload:
-            self.send_error(403, "Uploads are disabled")
-            return
         target_dir = self.translate(self.path)
         if target_dir is None:
             self.send_error(403, "Forbidden")
@@ -329,6 +421,56 @@ class FileShareHandler(BaseHTTPRequestHandler):
             target_dir = os.path.dirname(target_dir)
 
         ctype = self.headers.get("Content-Type", "")
+
+        # ----- plain urlencoded POSTs: selection-zip and "Create folder" -----
+        if ctype.startswith("application/x-www-form-urlencoded"):
+            try:
+                length = int(self.headers.get("Content-Length", 0))
+            except ValueError:
+                length = 0
+            body = self.rfile.read(length).decode("utf-8", "replace") if length > 0 else ""
+            params = urllib.parse.parse_qs(body)
+
+            # "Download selected (.zip)" — read-only, allowed even when
+            # uploads are disabled.
+            if "zipsel" in params:
+                self.serve_zip_selection(target_dir, params.get("sel", []))
+                return
+
+            if not type(self).allow_upload:
+                self.send_error(403, "Uploads are disabled")
+                return
+            raw = (params.get("newfolder") or [""])[0].strip()
+            # Sanitize: no path separators, no traversal, no leading dots.
+            name = raw.replace("/", "_").replace("\\", "_").strip()
+            name = re.sub(r'[:*?"<>|]', "_", name).strip(". ")
+            if not name:
+                self.send_error(400, "Invalid folder name")
+                return
+            dest = os.path.join(target_dir, name)
+            root = os.path.abspath(type(self).root_dir)
+            if not os.path.abspath(dest).startswith(root):
+                self.send_error(403, "Forbidden")
+                return
+            if os.path.exists(dest):
+                self.log_message("create folder skipped, already exists: %s", name)
+            else:
+                try:
+                    os.mkdir(dest)
+                    self.log_message("created folder: %s", name)
+                except OSError as e:
+                    self.log_message("create folder failed: %s", e)
+                    self.send_error(500, "Could not create folder")
+                    return
+            back = self.path if self.path.endswith("/") else self.path + "/"
+            self.send_response(303)
+            self.send_header("Location", back)
+            self.end_headers()
+            return
+
+        if not type(self).allow_upload:
+            self.send_error(403, "Uploads are disabled")
+            return
         if "multipart/form-data" not in ctype:
             self.send_error(400, "Expected multipart/form-data")
             return
@@ -415,9 +557,22 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
            border-radius: 8px; font-size: 14px; cursor: pointer; }}
   .upbtn:hover {{ background: #245a94; }}
   .toolbar {{ margin: 16px 0 0; display: flex; justify-content: flex-end; }}
+  .mkdirform {{ display: flex; gap: 8px; align-items: center; }}
+  .txt {{ padding: 8px 10px; border: 1px solid #cbd5e0; border-radius: 8px; font-size: 14px;
+         min-width: 160px; background: inherit; color: inherit; }}
+  .mkbtn {{ background: #6b46c1; }}
+  .mkbtn:hover {{ background: #553c9a; }}
   .zipbtn {{ display: inline-block; background: #2f855a; color: #fff; text-decoration: none;
-            padding: 9px 18px; border-radius: 8px; font-size: 14px; }}
+            padding: 9px 18px; border-radius: 8px; font-size: 14px; border: none;
+            cursor: pointer; font-family: inherit; }}
   .zipbtn:hover {{ background: #276749; }}
+  .selbtn {{ background: #b7791f; }}
+  .selbtn:hover {{ background: #975a16; }}
+  .selmsg {{ display: none; color: #c53030; font-size: 13px; font-weight: 600;
+            align-self: center; margin-right: auto; }}
+  .toolbar {{ gap: 8px; }}
+  td.chk, th.chk {{ width: 34px; text-align: center; padding-left: 10px; padding-right: 0; }}
+  .chk input {{ width: 16px; height: 16px; cursor: pointer; }}
   footer {{ text-align: center; color: #90949c; font-size: 12px; margin-top: 24px; }}
   @media (prefers-color-scheme: dark) {{
     body {{ background: #18191a; color: #e4e6eb; }}
@@ -435,14 +590,25 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
   <div class="path">{path}</div>
 </header>
 <div class="wrap">
-  <div class="toolbar">{downloadall}</div>
   {upload}
-  <table>
-    <thead><tr><th>Name</th><th>Size</th><th>Modified</th></tr></thead>
-    <tbody>
-      {rows}
-    </tbody>
-  </table>
+  <form method="POST" action="{action}"
+        onsubmit="var n=this.querySelectorAll('input[name=sel]:checked').length;
+                  var m=document.getElementById('selmsg');
+                  if(!n){{m.style.display='inline';return false;}}
+                  m.style.display='none';return true;">
+    <input type="hidden" name="zipsel" value="1">
+    <div class="toolbar"><span id="selmsg" class="selmsg">&#9888;&#65039; Tick at least one file or folder first</span>{downloadall}</div>
+    <table>
+      <thead><tr>
+        <th class="chk"><input type="checkbox" title="Select all"
+            onclick="document.querySelectorAll('input[name=sel]').forEach(c=>c.checked=this.checked)"></th>
+        <th>Name</th><th>Size</th><th>Modified</th>
+      </tr></thead>
+      <tbody>
+        {rows}
+      </tbody>
+    </table>
+  </form>
   <footer>{count} item(s) &middot; {app} file server</footer>
 </div>
 </body>

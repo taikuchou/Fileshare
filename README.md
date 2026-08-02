@@ -18,7 +18,8 @@ the window, `http.server` for the server).
 |--------------------------|-------------------------------------------------------------------|
 | `fileshare.py`           | The whole app — GUI + web server in one file.                     |
 | `run-windows-python.bat` | Windows one-step launcher: installs Python if needed, then runs the app. |
-| `fileshare-app-mac.jpg`  | Screenshot of the app (shown above).                              |
+| `fileshare-app-mac.jpg`  | Screenshot of the desktop app (shown above).                      |
+| `fileshare-web-ui.jpg`   | Screenshot of the web page visitors see (shown below).            |
 
 ---
 
@@ -31,7 +32,12 @@ the window, `http.server` for the server).
   - download individual files,
   - **Download all (.zip)** — grab the current folder (subfolders included) as
     one ZIP file, built on the fly,
-  - **upload** files back into the folder (can be turned off).
+  - **Download selected (.zip)** — tick any mix of files and folders and get
+    just those as one ZIP (with a select-all checkbox),
+  - **upload** files back into the folder (can be turned off),
+  - **create subfolders** with the *Create folder* button.
+- Full Unicode support — Chinese/Japanese/Korean (DBCS) file and folder names
+  work correctly for upload, download, browsing, and ZIPs.
 - The web page works on phones, tablets, and other computers, with a clean
   light/dark interface.
 - The app window shows a live activity log (who downloaded/uploaded what) and a
@@ -80,13 +86,20 @@ python3 fileshare.py
 
 ## Using the shared page (what visitors see)
 
+![The FileShare web page in a browser](fileshare-web-ui.jpg)
+
 - **Folders** — click to open; `↩ ..` goes back up.
 - **Files** — click to view/download.
-- **⬇️ Download all (.zip)** (top right) — downloads the folder currently shown,
+- **☑ Download selected (.zip)** — tick the checkboxes next to any files or
+  folders (the header checkbox selects all), then click this to download just
+  those items as one ZIP. If nothing is ticked, a warning appears instead.
+- **⬇️ Download all (.zip)** — downloads the folder currently shown,
   including everything inside it, as a single ZIP named after the folder.
 - **Upload** — choose one or more files and press *Upload here*; they land in
   the folder currently shown. If a name already exists, the new file is saved
   as `name (1).ext` instead of overwriting.
+- **📁 Create folder** — type a name and click to make a new subfolder in the
+  folder currently shown. (Hidden when uploads are disabled.)
 
 ---
 
@@ -124,4 +137,4 @@ python fileshare.py --no-gui -p 9000 /path/to/folder
 
 ---
 
-*FileShare 1.1 — single file, no dependencies, MIT-style free to use and modify.*
+*FileShare 1.4.1 — single file, no dependencies, MIT-style free to use and modify.*
